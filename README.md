@@ -142,20 +142,7 @@ En `UnlockService.java`:
 private static final long POLL_INTERVAL_MS = 3000; // 3 segundos
 ```
 
-### Soportar otras apps de escritorio remoto
-
-Modifica la detección en `isAnyDeskSessionActive()`:
-```java
-// Detectar cualquier app usando MediaProjection (no solo AnyDesk)
-return !output.contains("null");
-
-// O detectar una app específica
-return output.toLowerCase().contains("teamviewer");
-```
-
-### Usar patrón o contraseña en lugar de PIN
-
-Reemplaza la secuencia de keyevents en `performUnlock()` con gestos `input swipe` para desbloqueo por patrón, o `input text "contraseña"` para contraseñas de texto.
+> **Nota:** Esta herramienta está diseñada para el caso de uso específico de AnyDesk + PIN en un dispositivo personal. No se ofrece soporte ni documentación para adaptar esta herramienta a dispositivos de terceros o a escenarios no personales.
 
 ## Solución de problemas
 
