@@ -1,0 +1,20 @@
+# Built outputs
+build/
+app/build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.apk
+*.aab
+*.jks
+*.keystore
+fix_xposed.sh
