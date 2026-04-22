@@ -23,6 +23,8 @@ AutoScreenCap ejecuta un servicio en primer plano (foreground service) que verif
 3. **Ingresa tu PIN** mediante eventos de teclado
 4. **Verifica** que el desbloqueo fue exitoso (reintenta una vez si falla)
 
+Además soporta **Direct Boot**: el servicio arranca incluso antes del primer desbloqueo tras un reinicio (cuando `/data` aún está cifrado y el usuario no ha ingresado el PIN), y en ese caso **ejecuta un unlock incondicional** 8 segundos después del arranque para dejar el teléfono listo para conexiones AnyDesk sin intervención física.
+
 ## Requisitos
 
 - **Android 8.0+** (API 26)
@@ -116,7 +118,17 @@ adb shell pm grant com.autoscreencap android.permission.POST_NOTIFICATIONS
 
 ### Inicio automático al encender
 
-Un `BootReceiver` escucha `BOOT_COMPLETED` y `QUICKBOOT_POWERON` para iniciar el servicio automáticamente después de reiniciar el dispositivo.
+Un `BootReceiver` marcado como `directBootAware` escucha los broadcasts `LOCKED_BOOT_COMPLETED` (entregado **antes** del primer unlock), `BOOT_COMPLETED` y `QUICKBOOT_POWERON` para iniciar el servicio automáticamente después de reiniciar el dispositivo.
+
+### Direct Boot y unlock incondicional al arrancar
+
+Tanto `<application>`, `<service .UnlockService>` como `<receiver .BootReceiver>` declaran `android:directBootAware="true"`, lo que permite que el servicio arranque en la fase cifrada del boot (antes de que el usuario haya desbloqueado nunca el teléfono tras encenderlo).
+
+Cuando `UnlockService.onCreate()` detecta `UserManager.isUserUnlocked() == false`, programa un `performUnlock()` incondicional 8 segundos después (para dar tiempo a SystemUI a dibujar el Keyguard). Esto es necesario porque antes del primer unlock AnyDesk no puede capturar la pantalla, por lo que el polling normal de `dumpsys media_projection` no detectaría nada y el servicio se quedaría esperando indefinidamente.
+
+Para que el log funcione en esa fase, el servicio escribe en **device-protected storage** (`/data/user_de/0/<pkg>/files/`) en lugar del `credential-protected` habitual (`/data/data/<pkg>/files/`), que no está disponible hasta el primer unlock.
+
+> **Nota sobre ADB:** para que `adb shell input text <PIN>` funcione antes del primer unlock también hay que asegurarse de que la clave pública de ADB esté en una ruta que adbd pueda leer en esa fase (p. ej. reemplazando el archivo destino del symlink `/adb_keys` en la partición `product`). Este paso depende del dispositivo y queda fuera del alcance de esta app.
 
 ## Estructura del proyecto
 
@@ -153,9 +165,16 @@ private static final long POLL_INTERVAL_MS = 3000; // 3 segundos
 
 ### El desbloqueo falla
 
-- Revisa el log: `su -c "cat /data/data/com.autoscreencap/files/autoscreencap.log"`
+- Revisa el log (post-unlock): `su -c "cat /data/data/com.autoscreencap/files/autoscreencap.log"`
+- Revisa el log (pre-unlock / Direct Boot): `su -c "cat /data/user_de/0/com.autoscreencap/files/autoscreencap.log"`
 - Verifica que las coordenadas del deslizamiento correspondan a la resolución de tu pantalla
 - Verifica que los keycodes del PIN sean correctos
+
+### Tras reiniciar, el teléfono no se auto-desbloquea
+
+- Comprueba que el servicio arrancó pre-unlock: `adb shell "su -c 'dumpsys activity services com.autoscreencap'"` debe listar `UnlockService`
+- Comprueba que `adb shell input text` funciona antes del primer unlock (requiere clave pública ADB accesible pre-unlock)
+- Si el delay de 8s no es suficiente en tu dispositivo (SystemUI tarda más), auméntalo en `scheduleFirstBootUnlock()`
 
 ### El servicio se detiene después de un tiempo
 

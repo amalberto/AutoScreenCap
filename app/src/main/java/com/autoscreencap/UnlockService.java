@@ -38,6 +38,7 @@ public class UnlockService extends Service {
     private boolean polling = false;
     private volatile boolean alreadyUnlocked = false;
     private volatile boolean unlockInProgress = false;
+    private Context deviceCtx;
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -58,9 +59,57 @@ public class UnlockService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        log("UnlockService created");
+        // Use device-protected storage so log() works before the user unlocks
+        // (credential-protected storage is unavailable until first unlock).
+        deviceCtx = createDeviceProtectedStorageContext();
+        boolean unlocked = isUserUnlocked();
+        log("UnlockService created (userUnlocked=" + unlocked + ")");
         createNotificationChannel();
         startPolling();
+        if (!unlocked) {
+            scheduleFirstBootUnlock();
+        }
+    }
+
+    /**
+     * When the service starts during Direct Boot (pre first-unlock), trigger the
+     * PIN unlock sequence unconditionally once. This is required because AnyDesk
+     * (and its MediaProjection pipe) can only read the screen after the user
+     * is unlocked; before that, polling dumpsys media_projection finds nothing
+     * and the service would sit idle forever on a headless boot.
+     */
+    private void scheduleFirstBootUnlock() {
+        // Delay to give SystemUI time to draw the Keyguard and be ready to
+        // receive key events. 8s is conservative but reliable on cold boot.
+        final long delayMs = 8000;
+        log("First-boot pre-unlock scheduled in " + delayMs + "ms");
+        handler.postDelayed(() -> new Thread(() -> {
+            try {
+                if (isUserUnlocked()) {
+                    log("First-boot unlock skipped (already unlocked)");
+                    return;
+                }
+                if (unlockInProgress) {
+                    log("First-boot unlock skipped (unlock in progress)");
+                    return;
+                }
+                log("First-boot unlock: performing unconditional unlock");
+                unlockInProgress = true;
+                performUnlock();
+            } catch (Exception e) {
+                log("First-boot unlock error: " + e.getMessage());
+                unlockInProgress = false;
+            }
+        }, "FirstBootUnlock").start(), delayMs);
+    }
+
+    private boolean isUserUnlocked() {
+        try {
+            android.os.UserManager um = (android.os.UserManager) getSystemService(Context.USER_SERVICE);
+            return um != null && um.isUserUnlocked();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
@@ -222,7 +271,9 @@ public class UnlockService extends Service {
         Log.i(TAG, msg);
         try {
             String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
-            File logFile = new File(getFilesDir(), "autoscreencap.log");
+            // Write to device-protected storage so logging works pre-unlock
+            Context ctx = (deviceCtx != null) ? deviceCtx : this;
+            File logFile = new File(ctx.getFilesDir(), "autoscreencap.log");
             FileWriter fw = new FileWriter(logFile, true);
             fw.write(ts + " " + msg + "\n");
             fw.close();

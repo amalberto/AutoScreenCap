@@ -18,3 +18,10 @@ Thumbs.db
 *.jks
 *.keystore
 fix_xposed.sh
+
+# Local boot-image experiments / ADB key bootstrap (not part of the app)
+*.img
+_best_xz.bin
+build_patched_boot.py
+build_patched_boot_v2.py
+inject_adb_key.py
