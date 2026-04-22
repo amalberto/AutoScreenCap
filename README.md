@@ -139,8 +139,11 @@ Cuando la conexión remota cae de forma abrupta (pérdida de red del cliente, ci
 Para detectar y recuperar esa situación, `UnlockService` lanza un watchdog independiente del polling de desbloqueo:
 
 - Cada `WATCHDOG_INTERVAL_MS` (10 s por defecto) comprueba si AnyDesk figura en `dumpsys media_projection`.
-- Si es así, resuelve la UID del paquete (`com.anydesk.anydeskandroid`) y cuenta sus conexiones TCP **ESTABLISHED** leyendo `/proc/net/tcp` y `/proc/net/tcp6` (con fallback a `su cat` por si la ROM restringe la lectura a procesos ajenos).
-- Si hay `MediaProjection` sostenido pero cero conexiones establecidas durante `WATCHDOG_STUCK_THRESHOLD` chequeos consecutivos (por defecto 3, es decir, 30 s), ejecuta:
+- Si es así, resuelve la UID del paquete (`com.anydesk.anydeskandroid`) y construye un histograma de estados TCP leyendo `/proc/net/tcp` y `/proc/net/tcp6` (con fallback a `su cat` por si la ROM restringe la lectura a procesos ajenos).
+- Se considera **sesión huérfana** si, con `MediaProjection` sostenido, se da cualquiera de estos dos patrones:
+  1. Hay **sockets en CLOSE_WAIT / FIN_WAIT1 / FIN_WAIT2 / LAST_ACK** para la UID de AnyDesk — la huella que deja el peer remoto al cerrar mientras el servidor no ha terminado de finalizar el socket.
+  2. Hay **≤1 conexión ESTABLISHED** — es decir, solo el keepalive permanente al relay (`net.anydesk.com:7070`), sin ninguna conexión de datos encima.
+- Cuando cualquiera de las dos condiciones persiste `WATCHDOG_STUCK_THRESHOLD` ciclos seguidos (por defecto 2, es decir ≈20 s), ejecuta:
 
     ```bash
     am force-stop com.anydesk.anydeskandroid
@@ -151,7 +154,7 @@ Para detectar y recuperar esa situación, `UnlockService` lanza un watchdog inde
 
 - Tras cada reset se aplica un cooldown de `WATCHDOG_RESET_COOLDOWN_MS` (60 s) para evitar bucles de reinicio si la causa raíz persistiera.
 
-Los parámetros están en `UnlockService.java` como constantes (`WATCHDOG_INTERVAL_MS`, `WATCHDOG_STUCK_THRESHOLD`, `WATCHDOG_RESET_COOLDOWN_MS`). Todo evento del watchdog se escribe en el log habitual.
+Los parámetros están en `UnlockService.java` como constantes (`WATCHDOG_INTERVAL_MS`, `WATCHDOG_STUCK_THRESHOLD`, `WATCHDOG_RESET_COOLDOWN_MS`). Cada ciclo del watchdog escribe una línea en el log con el desglose de estados TCP observados (`est=`, `halfClosed=`), facilitando el diagnóstico si alguna vez no se dispara.
 
 ## Estructura del proyecto
 

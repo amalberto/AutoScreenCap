@@ -35,15 +35,37 @@ public class UnlockService extends Service {
     private static final String PIN_KEYEVENTS = "input keyevent 8; input keyevent 15; input keyevent 10; input keyevent 13; input keyevent 66";
 
     // --- Watchdog de sesion AnyDesk huerfana ---
-    // Si AnyDesk mantiene MediaProjection pero no tiene ninguna conexion TCP
-    // ESTABLISHED durante varias comprobaciones seguidas, consideramos que la
-    // sesion quedo colgada (el cliente remoto se desconecto de forma abrupta y
-    // el servidor no libero el MediaProjection). En ese caso, force-stop y
-    // relanzamos la app para que la siguiente conexion entrante funcione.
+    // Cuando la conexion remota cae de forma abrupta, el servidor AnyDesk en
+    // Android mantiene el MediaProjection sostenido y el siguiente intento de
+    // reconexion nunca prospera. Este watchdog detecta ese estado comparando
+    // la proyeccion activa con el reparto de estados TCP de la UID de AnyDesk.
+    //
+    // Heuristica:
+    //   - Una sesion AnyDesk sana mantiene >=1 conexion ESTABLISHED "extra"
+    //     ademas de la conexion permanente al relay (net.anydesk.com:7070),
+    //     y NUNCA tiene sockets en CLOSE_WAIT / FIN_WAIT / LAST_ACK.
+    //   - Una sesion huerfana se caracteriza por:
+    //         a) sockets en CLOSE_WAIT/FIN_WAIT1/FIN_WAIT2/LAST_ACK (codigos
+    //            TCP 04, 05, 08, 09 en /proc/net/tcp), que son la huella que
+    //            deja el peer remoto al cerrar mientras el servidor no lo ha
+    //            hecho, o bien
+    //         b) <=1 conexion ESTABLISHED (es decir, solo el relay keepalive
+    //            sin ninguna sesion de datos encima).
+    //
+    // Si cualquiera de esas condiciones se mantiene WATCHDOG_STUCK_THRESHOLD
+    // ciclos consecutivos, se asume sesion huerfana y se hace force-stop +
+    // relaunch de AnyDesk para liberar el MediaProjection.
     private static final String ANYDESK_PKG = "com.anydesk.anydeskandroid";
     private static final long WATCHDOG_INTERVAL_MS = 10_000;
-    private static final int WATCHDOG_STUCK_THRESHOLD = 3; // 3 * 10s = 30s sin conexiones
+    private static final int WATCHDOG_STUCK_THRESHOLD = 2; // 2 * 10s = 20s
     private static final long WATCHDOG_RESET_COOLDOWN_MS = 60_000;
+
+    // Codigos de estado TCP segun net/tcp_states.h
+    private static final int TCP_ESTABLISHED = 0x01;
+    private static final int TCP_FIN_WAIT1   = 0x04;
+    private static final int TCP_FIN_WAIT2   = 0x05;
+    private static final int TCP_CLOSE_WAIT  = 0x08;
+    private static final int TCP_LAST_ACK    = 0x09;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
@@ -281,10 +303,8 @@ public class UnlockService extends Service {
 
     /**
      * Detecta sesiones de AnyDesk que quedaron huerfanas despues de una
-     * desconexion abrupta del cliente: MediaProjection sigue sostenido por
-     * AnyDesk pero el proceso no tiene ninguna conexion TCP ESTABLISHED.
-     * Tras {@link #WATCHDOG_STUCK_THRESHOLD} comprobaciones seguidas en ese
-     * estado, force-stop + relanzar la app para liberar el MediaProjection.
+     * desconexion abrupta del cliente. Ver comentario de la seccion
+     * "Watchdog" en la cabecera de la clase para la heuristica completa.
      */
     private void checkAnyDeskSessionHealth() {
         boolean projectionHeld;
@@ -302,22 +322,34 @@ public class UnlockService extends Service {
 
         int uid = getAnyDeskUid();
         if (uid < 0) {
-            // Sin UID no podemos contar conexiones; abortar sin penalizar.
+            // Sin UID no podemos inspeccionar /proc/net/tcp de forma fiable.
             return;
         }
 
-        int established = countEstablishedTcpForUid(uid);
-        if (established > 0) {
+        int[] states = countTcpStatesForUid(uid);
+        int established = states[TCP_ESTABLISHED];
+        int halfClosed = states[TCP_FIN_WAIT1] + states[TCP_FIN_WAIT2]
+                + states[TCP_CLOSE_WAIT] + states[TCP_LAST_ACK];
+
+        // Condiciones de "sesion huerfana":
+        //  - hay sockets a medio cerrar (el peer remoto se fue), o
+        //  - solo queda el keepalive del relay (<=1 ESTABLISHED).
+        boolean stuck = (halfClosed > 0) || (established <= 1);
+
+        if (!stuck) {
             if (watchdogStuckCount != 0) {
-                log("Watchdog: AnyDesk conexiones=" + established + " -> sesion OK");
+                log("Watchdog: AnyDesk sesion OK (est=" + established
+                        + ", halfClosed=" + halfClosed + ")");
                 watchdogStuckCount = 0;
             }
             return;
         }
 
         watchdogStuckCount++;
-        log("Watchdog: AnyDesk projection held pero 0 conexiones establecidas ("
+        log("Watchdog: projection held + sospecha (est=" + established
+                + ", halfClosed=" + halfClosed + ") ("
                 + watchdogStuckCount + "/" + WATCHDOG_STUCK_THRESHOLD + ")");
+
         if (watchdogStuckCount < WATCHDOG_STUCK_THRESHOLD) {
             return;
         }
@@ -328,7 +360,7 @@ public class UnlockService extends Service {
             return;
         }
 
-        log("Watchdog: sesion AnyDesk huerfana detectada -> reiniciando app");
+        log("Watchdog: sesion AnyDesk huerfana confirmada -> reiniciando app");
         resetAnyDeskSession();
         watchdogStuckCount = 0;
         lastWatchdogResetAt = now;
@@ -348,51 +380,53 @@ public class UnlockService extends Service {
     }
 
     /**
-     * Cuenta filas ESTABLISHED (st=01) en /proc/net/tcp y /proc/net/tcp6
-     * cuyo campo uid (columna 8) coincide con el uid dado.
+     * Devuelve un histograma de estados TCP (indice = codigo de estado hex)
+     * para la UID dada, combinando /proc/net/tcp y /proc/net/tcp6. El array
+     * tiene tamanio 16, suficiente para los 11 estados TCP (01..0B).
      */
-    private int countEstablishedTcpForUid(int uid) {
-        int total = 0;
-        total += countEstablishedTcpForUidIn("/proc/net/tcp", uid);
-        total += countEstablishedTcpForUidIn("/proc/net/tcp6", uid);
-        return total;
+    private int[] countTcpStatesForUid(int uid) {
+        int[] counts = new int[16];
+        tallyTcpStatesForUid("/proc/net/tcp", uid, counts);
+        tallyTcpStatesForUid("/proc/net/tcp6", uid, counts);
+        return counts;
     }
 
-    private int countEstablishedTcpForUidIn(String path, int uid) {
-        int count = 0;
+    private void tallyTcpStatesForUid(String path, int uid, int[] counts) {
         BufferedReader br = null;
         try {
             br = new BufferedReader(new java.io.FileReader(path));
-            String line;
-            boolean header = true;
-            while ((line = br.readLine()) != null) {
-                if (header) { header = false; continue; }
-                // sl local_address rem_address st tx_queue rx_queue tr tm_when retrnsmt uid ...
-                String[] parts = line.trim().split("\\s+");
-                if (parts.length < 10) continue;
-                if (!"01".equalsIgnoreCase(parts[3])) continue; // ESTABLISHED
-                try {
-                    if (Integer.parseInt(parts[7]) == uid) count++;
-                } catch (NumberFormatException ignored) {}
-            }
+            tallyFromReader(br, uid, counts);
         } catch (Exception e) {
-            // En algunas ROMs /proc/net/tcp requiere root para ver conexiones
-            // de otros uid. Fallback: leer via su.
+            // Algunas ROMs restringen /proc/net/tcp a procesos ajenos.
+            // Fallback: leer via su.
             try {
                 String out = execRoot("cat " + path);
-                for (String line : out.split("\n")) {
-                    String[] parts = line.trim().split("\\s+");
-                    if (parts.length < 10) continue;
-                    if (!"01".equalsIgnoreCase(parts[3])) continue;
-                    try {
-                        if (Integer.parseInt(parts[7]) == uid) count++;
-                    } catch (NumberFormatException ignored) {}
-                }
+                tallyFromReader(new BufferedReader(new java.io.StringReader(out)),
+                        uid, counts);
             } catch (Exception ignored) {}
         } finally {
             if (br != null) try { br.close(); } catch (Exception ignored) {}
         }
-        return count;
+    }
+
+    private void tallyFromReader(BufferedReader br, int uid, int[] counts)
+            throws Exception {
+        String line;
+        boolean header = true;
+        while ((line = br.readLine()) != null) {
+            if (header) { header = false; continue; }
+            // sl local rem st tx:rx tr:tm_when retrnsmt uid ...
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length < 8) continue;
+            int rowUid;
+            try { rowUid = Integer.parseInt(parts[7]); }
+            catch (NumberFormatException e) { continue; }
+            if (rowUid != uid) continue;
+            int st;
+            try { st = Integer.parseInt(parts[3], 16); }
+            catch (NumberFormatException e) { continue; }
+            if (st >= 0 && st < counts.length) counts[st]++;
+        }
     }
 
     private void resetAnyDeskSession() {
