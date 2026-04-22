@@ -177,6 +177,34 @@ Como red de seguridad manual para cuando el watchdog automático no acierta (o s
 
 Los parámetros (`TRIPLE_UP_WINDOW_MS`, `TRIPLE_UP_COUNT`, `TRIPLE_UP_COOLDOWN_MS`) son ajustables como constantes en `UnlockService.java`.
 
+### Diálogos protegidos del sistema (permisos, install unknown apps, credentials)
+
+Desde Android 12, ciertos diálogos del sistema (permisos runtime, diálogos de "Instalar apps desconocidas", confirmación de credenciales, etc.) se marcan como **trusted overlays** y el `InputDispatcher` **descarta los taps inyectados** desde apps normales — incluida AnyDesk y su Control Plugin. El resultado: ves la pantalla pero AnyDesk no puede pulsar los botones ("Permitir"/"Denegar") y la sesión parece quedarse congelada.
+
+El único path de inyección que esos diálogos sí aceptan es el que viene por **shell root**, porque `input tap X Y` ejecutado desde `su` genera eventos con `POLICY_FLAG_TRUSTED`.
+
+Para resolverlo desde Windows sin depender de AnyDesk para los toques, esta herramienta incluye un pequeño helper:
+
+```powershell
+.\tools\tap.ps1
+```
+
+Abre una ventana que muestra en vivo (auto-refresco cada 1.5 s) el screenshot del teléfono vía `adb exec-out screencap -p`. Cada clic se traduce en:
+
+- **Botón izquierdo** → `adb shell "su -c 'input tap X Y'"` (toque inyectado a través del path trusted).
+- **Botón derecho** → `adb shell "su -c 'input keyevent KEYCODE_BACK'"`.
+- **Rueda / medio / F5 / botón "Refrescar"** → fuerza una captura inmediata.
+
+Uso típico: cuando AnyDesk no puede clicar un diálogo, abres `tap.ps1` en paralelo, resuelves el diálogo con 1–2 clics, y vuelves a AnyDesk para continuar.
+
+Parámetros:
+
+```powershell
+.\tools\tap.ps1 -AdbPath 'C:\ruta\adb.exe' -RefreshMs 1500
+```
+
+`-RefreshMs 0` desactiva el auto-refresco (útil si la red es lenta).
+
 ## Estructura del proyecto
 
 ```
