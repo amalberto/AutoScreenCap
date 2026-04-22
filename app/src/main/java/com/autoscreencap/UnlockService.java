@@ -27,7 +27,7 @@ public class UnlockService extends Service {
 
     private static final String TAG = "AutoScreenCap";
     private static final String CHANNEL_ID = "autoscreencap_channel";
-    private static final long POLL_INTERVAL_MS = 3000;
+    private static final long POLL_INTERVAL_MS = 10000;
     private static final String LOG_FILE = "/data/local/tmp/autoscreencap.log";
 
     // PIN keycodes: digit 0=7, 1=8, 2=9, 3=10, 4=11, 5=12, 6=13, 7=14, 8=15, 9=16

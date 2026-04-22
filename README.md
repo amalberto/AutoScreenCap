@@ -16,7 +16,7 @@ Cuando te conectas a tu teléfono Android de forma remota mediante AnyDesk, si e
 
 ## Solución
 
-AutoScreenCap ejecuta un servicio en primer plano (foreground service) que verifica cada 3 segundos. Cuando detecta una sesión activa de captura de pantalla de AnyDesk (`media_projection`) y el dispositivo está bloqueado, automáticamente:
+AutoScreenCap ejecuta un servicio en primer plano (foreground service) que verifica cada 10 segundos. Cuando detecta una sesión activa de captura de pantalla de AnyDesk (`media_projection`) y el dispositivo está bloqueado, automáticamente:
 
 1. **Enciende la pantalla** (`KEYEVENT_WAKEUP`)
 2. **Desliza hacia arriba** para mostrar el teclado PIN
@@ -120,6 +120,8 @@ adb shell pm grant com.autoscreencap android.permission.POST_NOTIFICATIONS
 
 Un `BootReceiver` marcado como `directBootAware` escucha los broadcasts `LOCKED_BOOT_COMPLETED` (entregado **antes** del primer unlock), `BOOT_COMPLETED` y `QUICKBOOT_POWERON` para iniciar el servicio automáticamente después de reiniciar el dispositivo.
 
+El mismo receptor escucha además `MY_PACKAGE_REPLACED`, que Android envía exclusivamente al paquete propio tras un `adb install -r` / update de la app. Así, el servicio se relanza inmediatamente tras una reinstalación en caliente sin tener que reiniciar el teléfono ni abrir la `MainActivity`.
+
 ### Direct Boot y unlock incondicional al arrancar
 
 Tanto `<application>`, `<service .UnlockService>` como `<receiver .BootReceiver>` declaran `android:directBootAware="true"`, lo que permite que el servicio arranque en la fase cifrada del boot (antes de que el usuario haya desbloqueado nunca el teléfono tras encenderlo).
@@ -172,7 +174,7 @@ app/src/main/
 
 En `UnlockService.java`:
 ```java
-private static final long POLL_INTERVAL_MS = 3000; // 3 segundos
+private static final long POLL_INTERVAL_MS = 10000; // 10 segundos
 ```
 
 > **Nota:** Esta herramienta está diseñada para el caso de uso específico de AnyDesk + PIN en un dispositivo personal. No se ofrece soporte ni documentación para adaptar esta herramienta a dispositivos de terceros o a escenarios no personales.
