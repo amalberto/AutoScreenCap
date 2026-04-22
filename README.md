@@ -130,6 +130,27 @@ Para que el log funcione en esa fase, el servicio escribe en **device-protected 
 
 > **Nota sobre ADB:** para que `adb shell input text <PIN>` funcione antes del primer unlock también hay que asegurarse de que la clave pública de ADB esté en una ruta que adbd pueda leer en esa fase (p. ej. reemplazando el archivo destino del symlink `/adb_keys` en la partición `product`). Este paso depende del dispositivo y queda fuera del alcance de esta app.
 
+### Watchdog de sesiones huérfanas de AnyDesk
+
+Cuando la conexión remota cae de forma abrupta (pérdida de red del cliente, cierre forzado, etc.), el servidor AnyDesk de Android a veces **no libera** el `MediaProjection` ni cierra la sesión. El resultado visible: el dispositivo parece seguir "conectado" y el siguiente intento de reconexión se queda colgado indefinidamente.
+
+Para detectar y recuperar esa situación, `UnlockService` lanza un watchdog independiente del polling de desbloqueo:
+
+- Cada `WATCHDOG_INTERVAL_MS` (10 s por defecto) comprueba si AnyDesk figura en `dumpsys media_projection`.
+- Si es así, resuelve la UID del paquete (`com.anydesk.anydeskandroid`) y cuenta sus conexiones TCP **ESTABLISHED** leyendo `/proc/net/tcp` y `/proc/net/tcp6` (con fallback a `su cat` por si la ROM restringe la lectura a procesos ajenos).
+- Si hay `MediaProjection` sostenido pero cero conexiones establecidas durante `WATCHDOG_STUCK_THRESHOLD` chequeos consecutivos (por defecto 3, es decir, 30 s), ejecuta:
+
+    ```bash
+    am force-stop com.anydesk.anydeskandroid
+    monkey -p com.anydesk.anydeskandroid -c android.intent.category.LAUNCHER 1
+    ```
+
+  Esto libera el `MediaProjection` colgado y relanza AnyDesk, dejándolo listo para aceptar la siguiente conexión.
+
+- Tras cada reset se aplica un cooldown de `WATCHDOG_RESET_COOLDOWN_MS` (60 s) para evitar bucles de reinicio si la causa raíz persistiera.
+
+Los parámetros están en `UnlockService.java` como constantes (`WATCHDOG_INTERVAL_MS`, `WATCHDOG_STUCK_THRESHOLD`, `WATCHDOG_RESET_COOLDOWN_MS`). Todo evento del watchdog se escribe en el log habitual.
+
 ## Estructura del proyecto
 
 ```

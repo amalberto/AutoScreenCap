@@ -34,11 +34,26 @@ public class UnlockService extends Service {
     // Change this to match YOUR PIN. Example below is for PIN "1836":
     private static final String PIN_KEYEVENTS = "input keyevent 8; input keyevent 15; input keyevent 10; input keyevent 13; input keyevent 66";
 
+    // --- Watchdog de sesion AnyDesk huerfana ---
+    // Si AnyDesk mantiene MediaProjection pero no tiene ninguna conexion TCP
+    // ESTABLISHED durante varias comprobaciones seguidas, consideramos que la
+    // sesion quedo colgada (el cliente remoto se desconecto de forma abrupta y
+    // el servidor no libero el MediaProjection). En ese caso, force-stop y
+    // relanzamos la app para que la siguiente conexion entrante funcione.
+    private static final String ANYDESK_PKG = "com.anydesk.anydeskandroid";
+    private static final long WATCHDOG_INTERVAL_MS = 10_000;
+    private static final int WATCHDOG_STUCK_THRESHOLD = 3; // 3 * 10s = 30s sin conexiones
+    private static final long WATCHDOG_RESET_COOLDOWN_MS = 60_000;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
     private volatile boolean alreadyUnlocked = false;
     private volatile boolean unlockInProgress = false;
     private Context deviceCtx;
+
+    private volatile int anyDeskUid = -1;
+    private int watchdogStuckCount = 0;
+    private long lastWatchdogResetAt = 0L;
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -53,6 +68,21 @@ public class UnlockService extends Service {
                 }
             }, "PollCheck").start();
             handler.postDelayed(this, POLL_INTERVAL_MS);
+        }
+    };
+
+    private final Runnable watchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!polling) return;
+            new Thread(() -> {
+                try {
+                    checkAnyDeskSessionHealth();
+                } catch (Exception e) {
+                    log("Watchdog error: " + e.getMessage());
+                }
+            }, "AnyDeskWatchdog").start();
+            handler.postDelayed(this, WATCHDOG_INTERVAL_MS);
         }
     };
 
@@ -151,7 +181,9 @@ public class UnlockService extends Service {
     private void startPolling() {
         polling = true;
         handler.postDelayed(pollRunnable, POLL_INTERVAL_MS);
-        log("Polling started (every " + POLL_INTERVAL_MS + "ms)");
+        handler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS);
+        log("Polling started (unlock every " + POLL_INTERVAL_MS + "ms, watchdog every "
+                + WATCHDOG_INTERVAL_MS + "ms)");
     }
 
     private void checkAndUnlock() {
@@ -245,6 +277,134 @@ public class UnlockService extends Service {
                 unlockInProgress = false;
             }
         }, "UnlockThread").start();
+    }
+
+    /**
+     * Detecta sesiones de AnyDesk que quedaron huerfanas despues de una
+     * desconexion abrupta del cliente: MediaProjection sigue sostenido por
+     * AnyDesk pero el proceso no tiene ninguna conexion TCP ESTABLISHED.
+     * Tras {@link #WATCHDOG_STUCK_THRESHOLD} comprobaciones seguidas en ese
+     * estado, force-stop + relanzar la app para liberar el MediaProjection.
+     */
+    private void checkAnyDeskSessionHealth() {
+        boolean projectionHeld;
+        try {
+            projectionHeld = isAnyDeskSessionActive();
+        } catch (Exception e) {
+            return;
+        }
+        if (!projectionHeld) {
+            if (watchdogStuckCount != 0) {
+                watchdogStuckCount = 0;
+            }
+            return;
+        }
+
+        int uid = getAnyDeskUid();
+        if (uid < 0) {
+            // Sin UID no podemos contar conexiones; abortar sin penalizar.
+            return;
+        }
+
+        int established = countEstablishedTcpForUid(uid);
+        if (established > 0) {
+            if (watchdogStuckCount != 0) {
+                log("Watchdog: AnyDesk conexiones=" + established + " -> sesion OK");
+                watchdogStuckCount = 0;
+            }
+            return;
+        }
+
+        watchdogStuckCount++;
+        log("Watchdog: AnyDesk projection held pero 0 conexiones establecidas ("
+                + watchdogStuckCount + "/" + WATCHDOG_STUCK_THRESHOLD + ")");
+        if (watchdogStuckCount < WATCHDOG_STUCK_THRESHOLD) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastWatchdogResetAt < WATCHDOG_RESET_COOLDOWN_MS) {
+            log("Watchdog: reset suprimido por cooldown");
+            return;
+        }
+
+        log("Watchdog: sesion AnyDesk huerfana detectada -> reiniciando app");
+        resetAnyDeskSession();
+        watchdogStuckCount = 0;
+        lastWatchdogResetAt = now;
+    }
+
+    private int getAnyDeskUid() {
+        int cached = anyDeskUid;
+        if (cached >= 0) return cached;
+        try {
+            android.content.pm.ApplicationInfo ai = getPackageManager()
+                    .getApplicationInfo(ANYDESK_PKG, 0);
+            anyDeskUid = ai.uid;
+            return anyDeskUid;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /**
+     * Cuenta filas ESTABLISHED (st=01) en /proc/net/tcp y /proc/net/tcp6
+     * cuyo campo uid (columna 8) coincide con el uid dado.
+     */
+    private int countEstablishedTcpForUid(int uid) {
+        int total = 0;
+        total += countEstablishedTcpForUidIn("/proc/net/tcp", uid);
+        total += countEstablishedTcpForUidIn("/proc/net/tcp6", uid);
+        return total;
+    }
+
+    private int countEstablishedTcpForUidIn(String path, int uid) {
+        int count = 0;
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new java.io.FileReader(path));
+            String line;
+            boolean header = true;
+            while ((line = br.readLine()) != null) {
+                if (header) { header = false; continue; }
+                // sl local_address rem_address st tx_queue rx_queue tr tm_when retrnsmt uid ...
+                String[] parts = line.trim().split("\\s+");
+                if (parts.length < 10) continue;
+                if (!"01".equalsIgnoreCase(parts[3])) continue; // ESTABLISHED
+                try {
+                    if (Integer.parseInt(parts[7]) == uid) count++;
+                } catch (NumberFormatException ignored) {}
+            }
+        } catch (Exception e) {
+            // En algunas ROMs /proc/net/tcp requiere root para ver conexiones
+            // de otros uid. Fallback: leer via su.
+            try {
+                String out = execRoot("cat " + path);
+                for (String line : out.split("\n")) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length < 10) continue;
+                    if (!"01".equalsIgnoreCase(parts[3])) continue;
+                    try {
+                        if (Integer.parseInt(parts[7]) == uid) count++;
+                    } catch (NumberFormatException ignored) {}
+                }
+            } catch (Exception ignored) {}
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
+        }
+        return count;
+    }
+
+    private void resetAnyDeskSession() {
+        try {
+            execRoot("am force-stop " + ANYDESK_PKG);
+            Thread.sleep(1500);
+            // monkey lanza la activity por defecto aunque la app no se este ejecutando
+            execRoot("monkey -p " + ANYDESK_PKG + " -c android.intent.category.LAUNCHER 1");
+            log("AnyDesk force-stop + relaunch ejecutados");
+        } catch (Exception e) {
+            log("resetAnyDeskSession fallo: " + e.getMessage());
+        }
     }
 
     private String execRoot(String command) throws Exception {
