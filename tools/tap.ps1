@@ -51,20 +51,29 @@ Add-Type -AssemblyName System.Drawing
 
 function Get-PhoneScreencap {
     param([string] $Adb)
-    # adb exec-out screencap -p sale en stdout binario puro (PNG).
-    # Lo capturamos como bytes para no corromperlo con la codificacion de PS.
-    $tmp = [System.IO.Path]::GetTempFileName() + '.png'
-    try {
-        & $Adb exec-out screencap -p | Set-Content -Path $tmp -Encoding Byte
-        if ((Get-Item $tmp).Length -lt 1024) {
-            throw "screencap devolvio un fichero de 0 bytes. Esta el movil conectado?"
-        }
-        $bytes = [System.IO.File]::ReadAllBytes($tmp)
-        $ms = New-Object System.IO.MemoryStream(,$bytes)
-        return [System.Drawing.Image]::FromStream($ms)
-    } finally {
-        if (Test-Path $tmp) { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    # adb exec-out screencap -p emite el PNG binario por stdout. Para no
+    # corromperlo por la codificacion de PS, volcamos stdout a un proceso
+    # con RedirectStandardOutput y leemos el BaseStream byte a byte.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $Adb
+    $psi.Arguments              = 'exec-out screencap -p'
+    $psi.UseShellExecute         = $false
+    $psi.RedirectStandardOutput  = $true
+    $psi.RedirectStandardError   = $true
+    $psi.CreateNoWindow          = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $ms = New-Object System.IO.MemoryStream
+    $proc.StandardOutput.BaseStream.CopyTo($ms)
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+
+    if ($ms.Length -lt 1024) {
+        throw ("screencap devolvio {0} bytes. stderr=[{1}]" -f $ms.Length, $stderr.Trim())
     }
+
+    $ms.Position = 0
+    return [System.Drawing.Image]::FromStream($ms)
 }
 
 function Invoke-PhoneTap {
