@@ -49,30 +49,53 @@ if (-not (Test-Path $AdbPath)) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-function Get-PhoneScreencap {
-    param([string] $Adb)
-    # adb exec-out screencap -p emite el PNG binario por stdout. Para no
-    # corromperlo por la codificacion de PS, volcamos stdout a un proceso
-    # con RedirectStandardOutput y leemos el BaseStream byte a byte.
+# Log a fichero para diagnosticar (el tap.log se sobreescribe en cada arranque).
+$script:LogPath = Join-Path $env:TEMP 'autoscreencap_tap.log'
+"=== tap.ps1 start $(Get-Date -Format o) ===" | Set-Content -Path $script:LogPath
+
+function Write-TapLog {
+    param([string] $Msg)
+    $ts = Get-Date -Format 'HH:mm:ss.fff'
+    Add-Content -Path $script:LogPath -Value "$ts  $Msg"
+}
+
+function Invoke-AdbCapture {
+    # Ejecuta adb con args y devuelve [bytes stdout, string stderr, int exitCode]
+    param(
+        [string]   $Adb,
+        [string[]] $ArgList
+    )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName               = $Adb
-    $psi.Arguments              = 'exec-out screencap -p'
+    foreach ($a in $ArgList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute         = $false
     $psi.RedirectStandardOutput  = $true
     $psi.RedirectStandardError   = $true
     $psi.CreateNoWindow          = $true
 
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $ms = New-Object System.IO.MemoryStream
+    $ms   = New-Object System.IO.MemoryStream
     $proc.StandardOutput.BaseStream.CopyTo($ms)
-    $stderr = $proc.StandardError.ReadToEnd()
+    $err  = $proc.StandardError.ReadToEnd()
     $proc.WaitForExit()
 
-    if ($ms.Length -lt 1024) {
-        throw ("screencap devolvio {0} bytes. stderr=[{1}]" -f $ms.Length, $stderr.Trim())
+    return [pscustomobject]@{
+        Bytes    = $ms.ToArray()
+        Stderr   = $err
+        ExitCode = $proc.ExitCode
     }
+}
 
-    $ms.Position = 0
+function Get-PhoneScreencap {
+    param([string] $Adb)
+    $res = Invoke-AdbCapture -Adb $Adb -ArgList @('exec-out','screencap','-p')
+    Write-TapLog ("screencap bytes={0} exit={1} stderrLen={2}" -f `
+        $res.Bytes.Length, $res.ExitCode, $res.Stderr.Length)
+    if ($res.Bytes.Length -lt 1024) {
+        throw ("screencap {0}B exit={1} stderr=[{2}]" -f `
+            $res.Bytes.Length, $res.ExitCode, $res.Stderr.Trim())
+    }
+    $ms = New-Object System.IO.MemoryStream(,$res.Bytes)
     return [System.Drawing.Image]::FromStream($ms)
 }
 
@@ -85,19 +108,44 @@ function Invoke-PhoneTap {
     # input tap ejecutado bajo su -> lleva POLICY_FLAG_TRUSTED, asi que los
     # dialogos protegidos de Android 12+ lo aceptan (a diferencia de los taps
     # inyectados por AnyDesk Control Plugin).
-    & $Adb shell "su -c `"input tap $X $Y`""
+    $cmd = "input tap $X $Y"
+    Write-TapLog "TAP -> $cmd"
+    $res = Invoke-AdbCapture -Adb $Adb -ArgList @('shell','su','-c',$cmd)
+    $stdout = [System.Text.Encoding]::UTF8.GetString($res.Bytes).Trim()
+    Write-TapLog ("  exit={0} stdout=[{1}] stderr=[{2}]" -f `
+        $res.ExitCode, $stdout, $res.Stderr.Trim())
 }
 
 function Invoke-PhoneBack {
     param([string] $Adb)
-    & $Adb shell "su -c `"input keyevent KEYCODE_BACK`""
+    Write-TapLog "BACK"
+    $res = Invoke-AdbCapture -Adb $Adb -ArgList @('shell','su','-c','input keyevent KEYCODE_BACK')
+    $stdout = [System.Text.Encoding]::UTF8.GetString($res.Bytes).Trim()
+    Write-TapLog ("  exit={0} stdout=[{1}] stderr=[{2}]" -f `
+        $res.ExitCode, $stdout, $res.Stderr.Trim())
 }
 
 # -------- UI --------
 $form = New-Object System.Windows.Forms.Form
 $form.Text           = 'AutoScreenCap · Remote Tap Helper'
-$form.StartPosition  = 'CenterScreen'
+$form.StartPosition  = 'Manual'
 $form.KeyPreview     = $true
+# Ventana alta para que el screenshot del movil (aspect ~9:20) entre sin
+# escalarse demasiado. Se dimensiona al 85% del alto de la pantalla y se
+# centra horizontalmente en el monitor primario.
+try {
+    $screen  = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $height  = [int]($screen.Height * 0.9)
+    $width   = [int]($height * 0.55)  # ~ proporcion 9:20 + panel inferior
+    if ($width -lt 500) { $width = 500 }
+    $form.Size     = New-Object System.Drawing.Size($width, $height)
+    $form.Location = New-Object System.Drawing.Point(
+        [int]($screen.X + ($screen.Width  - $width)  / 2),
+        [int]($screen.Y + ($screen.Height - $height) / 2))
+} catch {
+    $form.Size = New-Object System.Drawing.Size(600, 1000)
+}
+$form.MinimumSize = New-Object System.Drawing.Size(360, 600)
 
 $picture = New-Object System.Windows.Forms.PictureBox
 $picture.SizeMode = 'Zoom'
@@ -182,12 +230,15 @@ function Convert-ClickToPhoneCoords {
 
 $picture.Add_MouseDown({
     param($s, $e)
+    Write-TapLog ("MouseDown button={0} at {1},{2}" -f $e.Button, $e.X, $e.Y)
     $coords = Convert-ClickToPhoneCoords -Pic $picture -Img $script:currentImage `
         -ClickX $e.X -ClickY $e.Y
     if ($coords -eq $null) {
+        Write-TapLog "  click fuera de la imagen (currentImage null? $($script:currentImage -eq $null))"
         $lblStatus.Text = 'Click fuera de la imagen'
         return
     }
+    Write-TapLog ("  -> phone coords {0},{1}" -f $coords.X, $coords.Y)
     switch ($e.Button) {
         'Left' {
             $lblStatus.Text = "Tap $($coords.X),$($coords.Y)..."
