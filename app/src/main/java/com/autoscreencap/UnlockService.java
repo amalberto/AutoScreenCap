@@ -67,11 +67,31 @@ public class UnlockService extends Service {
     private static final int TCP_CLOSE_WAIT  = 0x08;
     private static final int TCP_LAST_ACK    = 0x09;
 
+    // --- Panic button: triple KEY_VOLUMEUP ---
+    // Fallback manual para cuando el watchdog automatico no resuelve la
+    // situacion (o no se le da tiempo): 3 pulsaciones rapidas del volumen-
+    // arriba en < TRIPLE_UP_WINDOW_MS fuerzan un soft-reboot reiniciando el
+    // zygote via setprop ctl.restart. Esto derriba ZYGOTE -> system_server
+    // -> SystemUI -> todas las apps en unos pocos segundos sin reiniciar el
+    // kernel, mucho mas rapido que un `reboot` completo y sin apagar ADB.
+    //
+    // Se lee /dev/input directamente con `getevent -lq` (corre bajo su) para
+    // que funcione con la pantalla apagada, con el Keyguard visible y con
+    // cualquier app en primer plano, sin depender de accessibility services
+    // (que Android 13+ filtra y que se desactivan tras algunos updates).
+    private static final long TRIPLE_UP_WINDOW_MS = 1500;
+    private static final int TRIPLE_UP_COUNT = 3;
+    private static final long TRIPLE_UP_COOLDOWN_MS = 10_000;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
     private volatile boolean alreadyUnlocked = false;
     private volatile boolean unlockInProgress = false;
     private Context deviceCtx;
+
+    private volatile Process keyWatcherProcess;
+    private volatile Thread keyWatcherThread;
+    private long lastPanicAt = 0L;
 
     private volatile int anyDeskUid = -1;
     private int watchdogStuckCount = 0;
@@ -118,6 +138,7 @@ public class UnlockService extends Service {
         log("UnlockService created (userUnlocked=" + unlocked + ")");
         createNotificationChannel();
         startPolling();
+        startKeyWatcher();
         if (!unlocked) {
             scheduleFirstBootUnlock();
         }
@@ -187,6 +208,7 @@ public class UnlockService extends Service {
         super.onDestroy();
         polling = false;
         handler.removeCallbacksAndMessages(null);
+        stopKeyWatcher();
         Log.i(TAG, "UnlockService destroyed");
     }
 
@@ -438,6 +460,103 @@ public class UnlockService extends Service {
             log("AnyDesk force-stop + relaunch ejecutados");
         } catch (Exception e) {
             log("resetAnyDeskSession fallo: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Arranca un hilo que lee /dev/input via `getevent -lq` y dispara un
+     * soft-reboot (reinicio del zygote) cuando detecta TRIPLE_UP_COUNT
+     * pulsaciones de KEY_VOLUMEUP en menos de TRIPLE_UP_WINDOW_MS.
+     *
+     * Nota: el subproceso corre bajo `su`, asi que puede leer eventos del
+     * kernel incluso con el dispositivo bloqueado o con la pantalla apagada.
+     */
+    private void startKeyWatcher() {
+        if (keyWatcherThread != null && keyWatcherThread.isAlive()) return;
+        Thread t = new Thread(this::keyWatcherLoop, "KeyWatcher");
+        t.setDaemon(true);
+        keyWatcherThread = t;
+        t.start();
+        log("KeyWatcher: listener de triple-volume-up iniciado");
+    }
+
+    private void stopKeyWatcher() {
+        Thread t = keyWatcherThread;
+        keyWatcherThread = null;
+        Process p = keyWatcherProcess;
+        keyWatcherProcess = null;
+        if (p != null) {
+            try { p.destroy(); } catch (Exception ignored) {}
+        }
+        if (t != null) t.interrupt();
+    }
+
+    private void keyWatcherLoop() {
+        // Bucle externo: si `getevent` muere (por cualquier razon: evento de
+        // boot, cambio de USB, etc.), reintentar indefinidamente con un
+        // pequenio backoff. La deteccion en si solo depende del patron
+        // "KEY_VOLUMEUP  DOWN", identico en todas las versiones de Android.
+        final long[] ups = new long[TRIPLE_UP_COUNT];
+        int idx = 0;
+
+        while (keyWatcherThread == Thread.currentThread()) {
+            Process proc = null;
+            try {
+                proc = Runtime.getRuntime().exec(new String[]{"su", "-c", "getevent -lq"});
+                keyWatcherProcess = proc;
+                BufferedReader br = new BufferedReader(
+                        new InputStreamReader(proc.getInputStream()));
+                String line;
+                while ((line = br.readLine()) != null
+                        && keyWatcherThread == Thread.currentThread()) {
+                    // Linea de interes (ejemplo):
+                    //   /dev/input/event3: EV_KEY       KEY_VOLUMEUP         DOWN
+                    if (!line.contains("KEY_VOLUMEUP")) continue;
+                    if (!line.contains("DOWN")) continue;
+
+                    long now = System.currentTimeMillis();
+                    ups[idx % TRIPLE_UP_COUNT] = now;
+                    idx++;
+                    if (idx < TRIPLE_UP_COUNT) continue;
+
+                    long oldest = ups[idx % TRIPLE_UP_COUNT];
+                    if (now - oldest > TRIPLE_UP_WINDOW_MS) continue;
+
+                    if (now - lastPanicAt < TRIPLE_UP_COOLDOWN_MS) {
+                        log("KeyWatcher: triple-up detectado pero en cooldown");
+                        continue;
+                    }
+                    lastPanicAt = now;
+                    log("KeyWatcher: TRIPLE volume-up detectado -> soft reboot");
+                    triggerSoftReboot();
+                    // Tras disparar no seguimos procesando: el sistema se
+                    // esta reiniciando de todos modos.
+                    break;
+                }
+            } catch (Exception e) {
+                log("KeyWatcher: error en getevent: " + e.getMessage());
+            } finally {
+                if (proc != null) try { proc.destroy(); } catch (Exception ignored) {}
+                keyWatcherProcess = null;
+            }
+
+            // Salida solicitada
+            if (keyWatcherThread != Thread.currentThread()) return;
+            try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
+        }
+    }
+
+    /**
+     * Reinicia el zygote via init. Derriba system_server, SystemUI y todas
+     * las apps (incluyendo AnyDesk, este servicio y cualquier MediaProjection
+     * colgada) en pocos segundos sin reiniciar el kernel ni ADB. El
+     * BootReceiver relanzara UnlockService en cuanto Android vuelva.
+     */
+    private void triggerSoftReboot() {
+        try {
+            execRoot("setprop ctl.restart zygote");
+        } catch (Exception e) {
+            log("triggerSoftReboot fallo: " + e.getMessage());
         }
     }
 

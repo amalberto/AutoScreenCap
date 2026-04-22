@@ -156,6 +156,27 @@ Para detectar y recuperar esa situación, `UnlockService` lanza un watchdog inde
 
 Los parámetros están en `UnlockService.java` como constantes (`WATCHDOG_INTERVAL_MS`, `WATCHDOG_STUCK_THRESHOLD`, `WATCHDOG_RESET_COOLDOWN_MS`). Cada ciclo del watchdog escribe una línea en el log con el desglose de estados TCP observados (`est=`, `halfClosed=`), facilitando el diagnóstico si alguna vez no se dispara.
 
+### Panic button: triple volume-up → soft reboot
+
+Como red de seguridad manual para cuando el watchdog automático no acierta (o simplemente quieres resolver el cuelgue al instante sin esperar la ventana de 20 s), el servicio escucha un patrón físico en el teclado del dispositivo: **tres pulsaciones consecutivas de la tecla Volumen+ en menos de 1.5 s** disparan un soft reboot reiniciando el zygote.
+
+- Se lee `/dev/input` directamente con `getevent -lq` bajo `su`, en un hilo dedicado. Por eso funciona:
+  - Con la **pantalla apagada**.
+  - Con el **Keyguard visible** (antes de desbloquear con PIN).
+  - Con **cualquier app en primer plano** (AnyDesk, launcher, vídeo a pantalla completa, etc.).
+  - Sin depender de un `AccessibilityService` (que Android 13+ filtra y que se desactiva solo tras algunos updates).
+- Pulsaciones únicas o dobles se ignoran: no interfieren con el control de volumen normal.
+- Al detectar el triple pulso, se ejecuta:
+
+    ```bash
+    setprop ctl.restart zygote
+    ```
+
+  Eso hace que `init` derribe `zygote` → `system_server` → SystemUI → todas las apps de usuario (AnyDesk, este servicio, cualquier `MediaProjection` colgada) en unos pocos segundos. El kernel **no** se reinicia, por lo que ADB sigue disponible durante toda la operación y el `BootReceiver` de esta app relanza `UnlockService` (con su `scheduleFirstBootUnlock()`) tan pronto como Android vuelve.
+- Tras cada disparo se aplica un cooldown de 10 s (`TRIPLE_UP_COOLDOWN_MS`) para evitar reinicios en cadena por rebotes del botón.
+
+Los parámetros (`TRIPLE_UP_WINDOW_MS`, `TRIPLE_UP_COUNT`, `TRIPLE_UP_COOLDOWN_MS`) son ajustables como constantes en `UnlockService.java`.
+
 ## Estructura del proyecto
 
 ```
