@@ -6,6 +6,8 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -104,6 +106,23 @@ public class UnlockService extends Service {
     private static final String ANYDESK_POWER_MARKER_2 = ANYDESK_PKG;
     private static final long TRIPLE_ANYDESK_WINDOW_MS = 3500;
 
+    // --- Panic trigger via clipboard (AnyDesk movil->movil) ---
+    // Cuando se controla el movil desde otro movil por AnyDesk no hay teclas
+    // fisicas utiles, pero AnyDesk sincroniza el portapapeles entre cliente
+    // y servidor en tiempo real. Asi que copiamos un token muy especifico en
+    // el movil-cliente, AnyDesk lo replica en este movil-servidor, y el
+    // listener de ClipboardManager lo detecta y dispara el soft-reboot.
+    //
+    // Android 10+ restringe getPrimaryClip() a la app en foreground / IME /
+    // accessibility; se evita ese bloqueo concediendo AppOpsManager
+    // READ_CLIPBOARD allow a esta app via root al arrancar el servicio.
+    //
+    // El token se limpia inmediatamente tras detectarse para evitar que una
+    // relectura (por rotaciones, reconexiones de AnyDesk, etc.) vuelva a
+    // disparar el reboot dentro del mismo ciclo.
+    private static final String CLIPBOARD_PANIC_TOKEN = "!!REBOOT!!";
+    private static final long CLIPBOARD_PANIC_COOLDOWN_MS = 10_000;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
     private volatile boolean alreadyUnlocked = false;
@@ -115,6 +134,10 @@ public class UnlockService extends Service {
     private volatile Process anyDeskWatcherProcess;
     private volatile Thread anyDeskWatcherThread;
     private long lastPanicAt = 0L;
+
+    private ClipboardManager clipboardManager;
+    private ClipboardManager.OnPrimaryClipChangedListener clipboardListener;
+    private long lastClipboardPanicAt = 0L;
 
     private volatile int anyDeskUid = -1;
     private int watchdogStuckCount = 0;
@@ -163,6 +186,7 @@ public class UnlockService extends Service {
         startPolling();
         startKeyWatcher();
         startAnyDeskPowerWatcher();
+        startClipboardWatcher();
         if (!unlocked) {
             scheduleFirstBootUnlock();
         }
@@ -234,6 +258,7 @@ public class UnlockService extends Service {
         handler.removeCallbacksAndMessages(null);
         stopKeyWatcher();
         stopAnyDeskPowerWatcher();
+        stopClipboardWatcher();
         Log.i(TAG, "UnlockService destroyed");
     }
 
@@ -543,6 +568,97 @@ public class UnlockService extends Service {
             try { p.destroy(); } catch (Exception ignored) {}
         }
         if (t != null) t.interrupt();
+    }
+
+    /**
+     * Registra un listener sobre el ClipboardManager del sistema que detecta
+     * cuando llega al portapapeles el token CLIPBOARD_PANIC_TOKEN y dispara
+     * el soft-reboot. El flujo tipico es:
+     *
+     *   1. Usuario copia "!!REBOOT!!" en el movil-cliente (otro movil).
+     *   2. AnyDesk sincroniza el portapapeles al movil-servidor (este).
+     *   3. ClipboardManager emite onPrimaryClipChanged.
+     *   4. Leemos el primary clip, si coincide disparamos triggerSoftReboot.
+     *
+     * Se concede AppOps READ_CLIPBOARD allow via root para saltar el bloqueo
+     * de Android 10+ que limita la lectura a la app en foreground / IME.
+     * El token se limpia inmediatamente tras detectarlo para evitar dobles
+     * disparos en la misma sesion.
+     */
+    private void startClipboardWatcher() {
+        try {
+            execRoot("appops set " + getPackageName() + " READ_CLIPBOARD allow");
+        } catch (Exception e) {
+            log("ClipboardWatcher: appops READ_CLIPBOARD fallo: " + e.getMessage());
+        }
+        try {
+            clipboardManager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboardManager == null) {
+                log("ClipboardWatcher: ClipboardManager no disponible");
+                return;
+            }
+            clipboardListener = new ClipboardManager.OnPrimaryClipChangedListener() {
+                @Override
+                public void onPrimaryClipChanged() {
+                    handleClipboardChanged();
+                }
+            };
+            // addPrimaryClipChangedListener debe llamarse en un hilo con
+            // Looper; el del main lo tiene.
+            handler.post(() -> {
+                try {
+                    clipboardManager.addPrimaryClipChangedListener(clipboardListener);
+                    log("ClipboardWatcher: listener registrado (token=" + CLIPBOARD_PANIC_TOKEN + ")");
+                } catch (Exception e) {
+                    log("ClipboardWatcher: addListener fallo: " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            log("ClipboardWatcher: start fallo: " + e.getMessage());
+        }
+    }
+
+    private void stopClipboardWatcher() {
+        final ClipboardManager cm = clipboardManager;
+        final ClipboardManager.OnPrimaryClipChangedListener l = clipboardListener;
+        clipboardManager = null;
+        clipboardListener = null;
+        if (cm != null && l != null) {
+            handler.post(() -> {
+                try { cm.removePrimaryClipChangedListener(l); } catch (Exception ignored) {}
+            });
+        }
+    }
+
+    private void handleClipboardChanged() {
+        try {
+            ClipboardManager cm = clipboardManager;
+            if (cm == null || !cm.hasPrimaryClip()) return;
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return;
+            CharSequence cs = clip.getItemAt(0).coerceToText(this);
+            if (cs == null) return;
+            String text = cs.toString().trim();
+            if (!CLIPBOARD_PANIC_TOKEN.equals(text)) return;
+
+            long now = System.currentTimeMillis();
+            if (now - lastClipboardPanicAt < CLIPBOARD_PANIC_COOLDOWN_MS) {
+                log("ClipboardWatcher: token detectado pero dentro de cooldown, ignorando");
+                return;
+            }
+            lastClipboardPanicAt = now;
+            log("ClipboardWatcher: token '" + CLIPBOARD_PANIC_TOKEN + "' detectado -> soft reboot");
+            // Limpia el portapapeles antes de reiniciar para evitar que al
+            // volver el sistema siga el token pegado y re-dispare.
+            try {
+                cm.setPrimaryClip(ClipData.newPlainText("", ""));
+            } catch (Exception ignored) {}
+            triggerSoftReboot();
+        } catch (SecurityException se) {
+            log("ClipboardWatcher: SecurityException leyendo clipboard (appops?): " + se.getMessage());
+        } catch (Exception e) {
+            log("ClipboardWatcher: error en handler: " + e.getMessage());
+        }
     }
 
     private void anyDeskPowerWatcherLoop() {
