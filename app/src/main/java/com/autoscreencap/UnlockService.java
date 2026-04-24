@@ -67,18 +67,24 @@ public class UnlockService extends Service {
     private static final int TCP_CLOSE_WAIT  = 0x08;
     private static final int TCP_LAST_ACK    = 0x09;
 
-    // --- Panic button: triple KEY_VOLUMEUP ---
+    // --- Panic button: triple KEY_VOLUMEUP o triple KEY_POWER ---
     // Fallback manual para cuando el watchdog automatico no resuelve la
     // situacion (o no se le da tiempo): 3 pulsaciones rapidas del volumen-
-    // arriba en < TRIPLE_UP_WINDOW_MS fuerzan un soft-reboot reiniciando el
-    // zygote via setprop ctl.restart. Esto derriba ZYGOTE -> system_server
-    // -> SystemUI -> todas las apps en unos pocos segundos sin reiniciar el
-    // kernel, mucho mas rapido que un `reboot` completo y sin apagar ADB.
+    // arriba O del boton de encendido en < TRIPLE_UP_WINDOW_MS fuerzan un
+    // soft-reboot reiniciando el zygote via setprop ctl.restart. Esto
+    // derriba ZYGOTE -> system_server -> SystemUI -> todas las apps en
+    // pocos segundos sin reiniciar el kernel, mucho mas rapido que un
+    // `reboot` completo y sin apagar ADB.
     //
     // Se lee /dev/input directamente con `getevent -lq` (corre bajo su) para
     // que funcione con la pantalla apagada, con el Keyguard visible y con
     // cualquier app en primer plano, sin depender de accessibility services
     // (que Android 13+ filtra y que se desactivan tras algunos updates).
+    //
+    // Sobre el boton de encendido: cada pulsacion apaga o enciende la
+    // pantalla, pero aun asi el kernel emite KEY_POWER DOWN en cada
+    // pulsacion, por lo que tres pulsaciones rapidas son detectables aunque
+    // la pantalla parpadee entre ellas.
     private static final long TRIPLE_UP_WINDOW_MS = 1500;
     private static final int TRIPLE_UP_COUNT = 3;
     private static final long TRIPLE_UP_COOLDOWN_MS = 10_000;
@@ -477,7 +483,7 @@ public class UnlockService extends Service {
         t.setDaemon(true);
         keyWatcherThread = t;
         t.start();
-        log("KeyWatcher: listener de triple-volume-up iniciado");
+        log("KeyWatcher: listener de triple-volume-up / triple-power iniciado");
     }
 
     private void stopKeyWatcher() {
@@ -495,9 +501,12 @@ public class UnlockService extends Service {
         // Bucle externo: si `getevent` muere (por cualquier razon: evento de
         // boot, cambio de USB, etc.), reintentar indefinidamente con un
         // pequenio backoff. La deteccion en si solo depende del patron
-        // "KEY_VOLUMEUP  DOWN", identico en todas las versiones de Android.
+        // "KEY_VOLUMEUP DOWN" o "KEY_POWER DOWN", identico en todas las
+        // versiones de Android.
         final long[] ups = new long[TRIPLE_UP_COUNT];
-        int idx = 0;
+        int upIdx = 0;
+        final long[] powers = new long[TRIPLE_UP_COUNT];
+        int powerIdx = 0;
 
         while (keyWatcherThread == Thread.currentThread()) {
             Process proc = null;
@@ -509,25 +518,47 @@ public class UnlockService extends Service {
                 String line;
                 while ((line = br.readLine()) != null
                         && keyWatcherThread == Thread.currentThread()) {
-                    // Linea de interes (ejemplo):
-                    //   /dev/input/event3: EV_KEY       KEY_VOLUMEUP         DOWN
-                    if (!line.contains("KEY_VOLUMEUP")) continue;
+                    // Lineas de interes (ejemplo):
+                    //   /dev/input/event3: EV_KEY  KEY_VOLUMEUP  DOWN
+                    //   /dev/input/event0: EV_KEY  KEY_POWER     DOWN
                     if (!line.contains("DOWN")) continue;
 
-                    long now = System.currentTimeMillis();
-                    ups[idx % TRIPLE_UP_COUNT] = now;
-                    idx++;
-                    if (idx < TRIPLE_UP_COUNT) continue;
+                    boolean isVolUp = line.contains("KEY_VOLUMEUP");
+                    // KEY_POWER matchea tambien KEY_POWER2, presente en
+                    // algunos dispositivos; descartamos explicitamente
+                    // KEY_VOLUMEUP por si acaso alguna tecla incluyera
+                    // "POWER" como substring (no deberia, pero defensivo).
+                    boolean isPower = !isVolUp && line.contains("KEY_POWER");
+                    if (!isVolUp && !isPower) continue;
 
-                    long oldest = ups[idx % TRIPLE_UP_COUNT];
+                    long now = System.currentTimeMillis();
+                    long[] ring;
+                    int ringIdx;
+                    String label;
+                    if (isVolUp) {
+                        ups[upIdx % TRIPLE_UP_COUNT] = now;
+                        upIdx++;
+                        ring = ups;
+                        ringIdx = upIdx;
+                        label = "volume-up";
+                    } else {
+                        powers[powerIdx % TRIPLE_UP_COUNT] = now;
+                        powerIdx++;
+                        ring = powers;
+                        ringIdx = powerIdx;
+                        label = "power";
+                    }
+                    if (ringIdx < TRIPLE_UP_COUNT) continue;
+
+                    long oldest = ring[ringIdx % TRIPLE_UP_COUNT];
                     if (now - oldest > TRIPLE_UP_WINDOW_MS) continue;
 
                     if (now - lastPanicAt < TRIPLE_UP_COOLDOWN_MS) {
-                        log("KeyWatcher: triple-up detectado pero en cooldown");
+                        log("KeyWatcher: triple-" + label + " detectado pero en cooldown");
                         continue;
                     }
                     lastPanicAt = now;
-                    log("KeyWatcher: TRIPLE volume-up detectado -> soft reboot");
+                    log("KeyWatcher: TRIPLE " + label + " detectado -> soft reboot");
                     triggerSoftReboot();
                     // Tras disparar no seguimos procesando: el sistema se
                     // esta reiniciando de todos modos.
