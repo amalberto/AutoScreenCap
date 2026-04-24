@@ -67,27 +67,42 @@ public class UnlockService extends Service {
     private static final int TCP_CLOSE_WAIT  = 0x08;
     private static final int TCP_LAST_ACK    = 0x09;
 
-    // --- Panic button: triple KEY_VOLUMEUP o triple KEY_POWER ---
+    // --- Panic button: triple KEY_APPSELECT (boton de recientes) ---
     // Fallback manual para cuando el watchdog automatico no resuelve la
-    // situacion (o no se le da tiempo): 3 pulsaciones rapidas del volumen-
-    // arriba O del boton de encendido en < TRIPLE_UP_WINDOW_MS fuerzan un
-    // soft-reboot reiniciando el zygote via setprop ctl.restart. Esto
-    // derriba ZYGOTE -> system_server -> SystemUI -> todas las apps en
-    // pocos segundos sin reiniciar el kernel, mucho mas rapido que un
-    // `reboot` completo y sin apagar ADB.
+    // situacion: 3 pulsaciones rapidas del boton de recientes en
+    // < TRIPLE_UP_WINDOW_MS fuerzan un soft-reboot reiniciando el zygote
+    // via setprop ctl.restart. Esto derriba ZYGOTE -> system_server ->
+    // SystemUI -> todas las apps en unos pocos segundos sin reiniciar el
+    // kernel, mucho mas rapido que un `reboot` completo y sin apagar ADB.
     //
     // Se lee /dev/input directamente con `getevent -lq` (corre bajo su) para
     // que funcione con la pantalla apagada, con el Keyguard visible y con
     // cualquier app en primer plano, sin depender de accessibility services
     // (que Android 13+ filtra y que se desactivan tras algunos updates).
     //
-    // Sobre el boton de encendido: cada pulsacion apaga o enciende la
-    // pantalla, pero aun asi el kernel emite KEY_POWER DOWN en cada
-    // pulsacion, por lo que tres pulsaciones rapidas son detectables aunque
-    // la pantalla parpadee entre ellas.
+    // Se descartaron KEY_POWER (uso normal de bloquear/desbloquear
+    // generaba 3 DOWN facilmente) y KEY_VOLUMEUP (afectaba ajuste de volumen
+    // durante musica/llamadas). El boton de recientes no se usa casi nunca
+    // en navegacion por gestos, asi que es el trigger fisico mas seguro.
     private static final long TRIPLE_UP_WINDOW_MS = 1500;
     private static final int TRIPLE_UP_COUNT = 3;
     private static final long TRIPLE_UP_COOLDOWN_MS = 10_000;
+
+    // --- Panic button via AnyDesk: triple boton de encendido remoto ---
+    // AnyDesk no inyecta KEY_POWER al kernel; en su lugar llama al framework
+    // (PowerManager.wakeUp / goToSleep) por lo que getevent NO lo ve. La
+    // unica traza fiable en el sistema es una linea en logcat cada vez que
+    // AnyDesk despierta la pantalla:
+    //
+    //   I/PowerManagerService: Allowing device wake-up without
+    //       android.permission.TURN_SCREEN_ON for com.anydesk.anydeskandroid
+    //
+    // Detectamos 3 apariciones de esa linea en TRIPLE_ANYDESK_WINDOW_MS para
+    // disparar el mismo soft-reboot. La ventana es mas amplia que la del
+    // boton fisico porque hay latencia de red en cada pulsacion remota.
+    private static final String ANYDESK_POWER_MARKER_1 = "Allowing device wake-up";
+    private static final String ANYDESK_POWER_MARKER_2 = ANYDESK_PKG;
+    private static final long TRIPLE_ANYDESK_WINDOW_MS = 3500;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
@@ -97,6 +112,8 @@ public class UnlockService extends Service {
 
     private volatile Process keyWatcherProcess;
     private volatile Thread keyWatcherThread;
+    private volatile Process anyDeskWatcherProcess;
+    private volatile Thread anyDeskWatcherThread;
     private long lastPanicAt = 0L;
 
     private volatile int anyDeskUid = -1;
@@ -145,6 +162,7 @@ public class UnlockService extends Service {
         createNotificationChannel();
         startPolling();
         startKeyWatcher();
+        startAnyDeskPowerWatcher();
         if (!unlocked) {
             scheduleFirstBootUnlock();
         }
@@ -215,6 +233,7 @@ public class UnlockService extends Service {
         polling = false;
         handler.removeCallbacksAndMessages(null);
         stopKeyWatcher();
+        stopAnyDeskPowerWatcher();
         Log.i(TAG, "UnlockService destroyed");
     }
 
@@ -478,12 +497,12 @@ public class UnlockService extends Service {
      * kernel incluso con el dispositivo bloqueado o con la pantalla apagada.
      */
     private void startKeyWatcher() {
-        if (keyWatcherThread != null && keyWatcherThread.isAlive()) return;
-        Thread t = new Thread(this::keyWatcherLoop, "KeyWatcher");
-        t.setDaemon(true);
-        keyWatcherThread = t;
-        t.start();
-        log("KeyWatcher: listener de triple-volume-up / triple-power iniciado");
+        // DESACTIVADO: el panic fisico por hardware esta deshabilitado.
+        // - KEY_POWER: disparaba reboots en el uso normal de bloquear/desbloquear.
+        // - KEY_VOLUMEUP: afectaba subir volumen durante videos/llamadas.
+        // - KEY_APPSELECT: en nav por gestos no se emite al kernel.
+        // El panic queda exclusivamente via AnyDeskPowerWatcher (logcat).
+        log("KeyWatcher: panic fisico DESACTIVADO (solo via AnyDesk)");
     }
 
     private void stopKeyWatcher() {
@@ -497,16 +516,91 @@ public class UnlockService extends Service {
         if (t != null) t.interrupt();
     }
 
+    /**
+     * Arranca un hilo que hace `logcat -v time PowerManagerService:I *:S` y
+     * dispara el mismo soft-reboot cuando detecta TRIPLE_UP_COUNT mensajes
+     * "Allowing device wake-up ... com.anydesk.anydeskandroid" dentro de
+     * TRIPLE_ANYDESK_WINDOW_MS. Esto cubre el caso en el que el usuario
+     * pulsa 3 veces el boton de encendido a traves de AnyDesk, donde las
+     * pulsaciones no llegan al kernel (no las ve getevent).
+     */
+    private void startAnyDeskPowerWatcher() {
+        if (anyDeskWatcherThread != null && anyDeskWatcherThread.isAlive()) return;
+        Thread t = new Thread(this::anyDeskPowerWatcherLoop, "AnyDeskPowerWatcher");
+        t.setDaemon(true);
+        anyDeskWatcherThread = t;
+        t.start();
+        log("AnyDeskPowerWatcher: listener de triple-power-via-AnyDesk iniciado");
+    }
+
+    private void stopAnyDeskPowerWatcher() {
+        Thread t = anyDeskWatcherThread;
+        anyDeskWatcherThread = null;
+        Process p = anyDeskWatcherProcess;
+        anyDeskWatcherProcess = null;
+        if (p != null) {
+            try { p.destroy(); } catch (Exception ignored) {}
+        }
+        if (t != null) t.interrupt();
+    }
+
+    private void anyDeskPowerWatcherLoop() {
+        final long[] hits = new long[TRIPLE_UP_COUNT];
+        int idx = 0;
+
+        while (anyDeskWatcherThread == Thread.currentThread()) {
+            Process proc = null;
+            try {
+                // -T 1 evita replays del buffer al iniciar. Filtramos en
+                // PowerManagerService:I y silenciamos el resto con *:S para
+                // minimizar consumo.
+                proc = Runtime.getRuntime().exec(new String[]{
+                        "su", "-c", "logcat -v time -T 1 PowerManagerService:I *:S"});
+                anyDeskWatcherProcess = proc;
+                BufferedReader br = new BufferedReader(
+                        new InputStreamReader(proc.getInputStream()));
+                String line;
+                while ((line = br.readLine()) != null
+                        && anyDeskWatcherThread == Thread.currentThread()) {
+                    if (!line.contains(ANYDESK_POWER_MARKER_1)) continue;
+                    if (!line.contains(ANYDESK_POWER_MARKER_2)) continue;
+
+                    long now = System.currentTimeMillis();
+                    hits[idx % TRIPLE_UP_COUNT] = now;
+                    idx++;
+                    if (idx < TRIPLE_UP_COUNT) continue;
+
+                    long oldest = hits[idx % TRIPLE_UP_COUNT];
+                    if (now - oldest > TRIPLE_ANYDESK_WINDOW_MS) continue;
+
+                    if (now - lastPanicAt < TRIPLE_UP_COOLDOWN_MS) {
+                        log("AnyDeskPowerWatcher: triple detectado pero en cooldown");
+                        continue;
+                    }
+                    lastPanicAt = now;
+                    log("AnyDeskPowerWatcher: TRIPLE power-via-AnyDesk detectado -> soft reboot");
+                    triggerSoftReboot();
+                    break;
+                }
+            } catch (Exception e) {
+                log("AnyDeskPowerWatcher: error en logcat: " + e.getMessage());
+            } finally {
+                if (proc != null) try { proc.destroy(); } catch (Exception ignored) {}
+                anyDeskWatcherProcess = null;
+            }
+
+            if (anyDeskWatcherThread != Thread.currentThread()) return;
+            try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
+        }
+    }
+
     private void keyWatcherLoop() {
         // Bucle externo: si `getevent` muere (por cualquier razon: evento de
         // boot, cambio de USB, etc.), reintentar indefinidamente con un
         // pequenio backoff. La deteccion en si solo depende del patron
-        // "KEY_VOLUMEUP DOWN" o "KEY_POWER DOWN", identico en todas las
-        // versiones de Android.
-        final long[] ups = new long[TRIPLE_UP_COUNT];
-        int upIdx = 0;
-        final long[] powers = new long[TRIPLE_UP_COUNT];
-        int powerIdx = 0;
+        // "KEY_APPSELECT DOWN", identico en todas las versiones de Android.
+        final long[] hits = new long[TRIPLE_UP_COUNT];
+        int idx = 0;
 
         while (keyWatcherThread == Thread.currentThread()) {
             Process proc = null;
@@ -518,47 +612,25 @@ public class UnlockService extends Service {
                 String line;
                 while ((line = br.readLine()) != null
                         && keyWatcherThread == Thread.currentThread()) {
-                    // Lineas de interes (ejemplo):
-                    //   /dev/input/event3: EV_KEY  KEY_VOLUMEUP  DOWN
-                    //   /dev/input/event0: EV_KEY  KEY_POWER     DOWN
+                    // Linea de interes (ejemplo):
+                    //   /dev/input/event3: EV_KEY  KEY_APPSELECT  DOWN
+                    if (!line.contains("KEY_APPSELECT")) continue;
                     if (!line.contains("DOWN")) continue;
 
-                    boolean isVolUp = line.contains("KEY_VOLUMEUP");
-                    // KEY_POWER matchea tambien KEY_POWER2, presente en
-                    // algunos dispositivos; descartamos explicitamente
-                    // KEY_VOLUMEUP por si acaso alguna tecla incluyera
-                    // "POWER" como substring (no deberia, pero defensivo).
-                    boolean isPower = !isVolUp && line.contains("KEY_POWER");
-                    if (!isVolUp && !isPower) continue;
-
                     long now = System.currentTimeMillis();
-                    long[] ring;
-                    int ringIdx;
-                    String label;
-                    if (isVolUp) {
-                        ups[upIdx % TRIPLE_UP_COUNT] = now;
-                        upIdx++;
-                        ring = ups;
-                        ringIdx = upIdx;
-                        label = "volume-up";
-                    } else {
-                        powers[powerIdx % TRIPLE_UP_COUNT] = now;
-                        powerIdx++;
-                        ring = powers;
-                        ringIdx = powerIdx;
-                        label = "power";
-                    }
-                    if (ringIdx < TRIPLE_UP_COUNT) continue;
+                    hits[idx % TRIPLE_UP_COUNT] = now;
+                    idx++;
+                    if (idx < TRIPLE_UP_COUNT) continue;
 
-                    long oldest = ring[ringIdx % TRIPLE_UP_COUNT];
+                    long oldest = hits[idx % TRIPLE_UP_COUNT];
                     if (now - oldest > TRIPLE_UP_WINDOW_MS) continue;
 
                     if (now - lastPanicAt < TRIPLE_UP_COOLDOWN_MS) {
-                        log("KeyWatcher: triple-" + label + " detectado pero en cooldown");
+                        log("KeyWatcher: triple-recents detectado pero en cooldown");
                         continue;
                     }
                     lastPanicAt = now;
-                    log("KeyWatcher: TRIPLE " + label + " detectado -> soft reboot");
+                    log("KeyWatcher: TRIPLE recents detectado -> soft reboot");
                     triggerSoftReboot();
                     // Tras disparar no seguimos procesando: el sistema se
                     // esta reiniciando de todos modos.
