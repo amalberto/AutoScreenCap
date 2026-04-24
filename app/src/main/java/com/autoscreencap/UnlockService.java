@@ -497,12 +497,12 @@ public class UnlockService extends Service {
      * kernel incluso con el dispositivo bloqueado o con la pantalla apagada.
      */
     private void startKeyWatcher() {
-        // DESACTIVADO: el panic fisico por hardware esta deshabilitado.
-        // - KEY_POWER: disparaba reboots en el uso normal de bloquear/desbloquear.
-        // - KEY_VOLUMEUP: afectaba subir volumen durante videos/llamadas.
-        // - KEY_APPSELECT: en nav por gestos no se emite al kernel.
-        // El panic queda exclusivamente via AnyDeskPowerWatcher (logcat).
-        log("KeyWatcher: panic fisico DESACTIVADO (solo via AnyDesk)");
+        if (keyWatcherThread != null && keyWatcherThread.isAlive()) return;
+        Thread t = new Thread(this::keyWatcherLoop, "KeyWatcher");
+        t.setDaemon(true);
+        keyWatcherThread = t;
+        t.start();
+        log("KeyWatcher: listener de triple-volume-up iniciado");
     }
 
     private void stopKeyWatcher() {
@@ -525,12 +525,13 @@ public class UnlockService extends Service {
      * pulsaciones no llegan al kernel (no las ve getevent).
      */
     private void startAnyDeskPowerWatcher() {
-        if (anyDeskWatcherThread != null && anyDeskWatcherThread.isAlive()) return;
-        Thread t = new Thread(this::anyDeskPowerWatcherLoop, "AnyDeskPowerWatcher");
-        t.setDaemon(true);
-        anyDeskWatcherThread = t;
-        t.start();
-        log("AnyDeskPowerWatcher: listener de triple-power-via-AnyDesk iniciado");
+        // DESACTIVADO: el marcador 'Allowing device wake-up ... com.anydesk...'
+        // no es exclusivo del boton de encendido de AnyDesk: tambien se emite
+        // al recibir ciertos taps/escritura, lo que producia reboots
+        // accidentales cuando se escribe en el movil via remoto. Mientras no
+        // encontremos una firma especifica del power-button remoto, se queda
+        // off.
+        log("AnyDeskPowerWatcher: DESACTIVADO por falsos positivos al escribir");
     }
 
     private void stopAnyDeskPowerWatcher() {
@@ -598,7 +599,7 @@ public class UnlockService extends Service {
         // Bucle externo: si `getevent` muere (por cualquier razon: evento de
         // boot, cambio de USB, etc.), reintentar indefinidamente con un
         // pequenio backoff. La deteccion en si solo depende del patron
-        // "KEY_APPSELECT DOWN", identico en todas las versiones de Android.
+        // "KEY_VOLUMEUP DOWN", identico en todas las versiones de Android.
         final long[] hits = new long[TRIPLE_UP_COUNT];
         int idx = 0;
 
@@ -613,8 +614,8 @@ public class UnlockService extends Service {
                 while ((line = br.readLine()) != null
                         && keyWatcherThread == Thread.currentThread()) {
                     // Linea de interes (ejemplo):
-                    //   /dev/input/event3: EV_KEY  KEY_APPSELECT  DOWN
-                    if (!line.contains("KEY_APPSELECT")) continue;
+                    //   /dev/input/event3: EV_KEY  KEY_VOLUMEUP  DOWN
+                    if (!line.contains("KEY_VOLUMEUP")) continue;
                     if (!line.contains("DOWN")) continue;
 
                     long now = System.currentTimeMillis();
@@ -626,11 +627,11 @@ public class UnlockService extends Service {
                     if (now - oldest > TRIPLE_UP_WINDOW_MS) continue;
 
                     if (now - lastPanicAt < TRIPLE_UP_COOLDOWN_MS) {
-                        log("KeyWatcher: triple-recents detectado pero en cooldown");
+                        log("KeyWatcher: triple-volume-up detectado pero en cooldown");
                         continue;
                     }
                     lastPanicAt = now;
-                    log("KeyWatcher: TRIPLE recents detectado -> soft reboot");
+                    log("KeyWatcher: TRIPLE volume-up detectado -> soft reboot");
                     triggerSoftReboot();
                     // Tras disparar no seguimos procesando: el sistema se
                     // esta reiniciando de todos modos.
