@@ -66,8 +66,15 @@ function Invoke-AdbCapture {
         [string[]] $ArgList
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $Adb
-    foreach ($a in $ArgList) { [void]$psi.ArgumentList.Add($a) }
+    $psi.FileName = $Adb
+    # ProcessStartInfo.ArgumentList solo existe en .NET Core/5+ (pwsh 7).
+    # En Windows PowerShell 5.1 (.NET Framework) no existe y falla con
+    # "No se puede llamar a un metodo en una expresion con valor NULL".
+    # Usamos .Arguments (string unico) con escape, compatible con ambos.
+    $escaped = foreach ($a in $ArgList) {
+        if ($a -match '[\s"]') { '"' + ($a -replace '"','\"') + '"' } else { $a }
+    }
+    $psi.Arguments               = ($escaped -join ' ')
     $psi.UseShellExecute         = $false
     $psi.RedirectStandardOutput  = $true
     $psi.RedirectStandardError   = $true
