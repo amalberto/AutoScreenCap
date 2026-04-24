@@ -25,6 +25,19 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".PanicActivity"
+            android:exported="true"
+            android:label="Panic"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".UnlockService"
             android:exported="false"
